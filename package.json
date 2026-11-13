@@ -1,0 +1,27 @@
+{
+  "name": "pairdrop-node",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "description": "Headless PairDrop protocol node: send a local file to a paired phone with zero polling",
+  "scripts": {
+    "ask": "node ask.js",
+    "setup": "node setup.js",
+    "mcp": "node mcp-server.js",
+    "pair": "node pair.js",
+    "send": "node send.js",
+    "recv-once": "node recv-once.js",
+    "receive": "node receive.js",
+    "daemon": "node daemon.js",
+    "probe": "node probe.js",
+    "test:rtc": "node selftest.js",
+    "test:receive": "node selftest-receive.js",
+    "test:lifecycle": "node selftest-lifecycle.js",
+    "test:mcp": "node selftest-mcp.js",
+    "test:name": "node nametest.js"
+  },
+  "dependencies": {
+    "node-datachannel": "^0.33.6",
+    "ws": "^8.23.0"
+  }
+}
