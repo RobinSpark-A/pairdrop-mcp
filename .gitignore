@@ -1,0 +1,16 @@
+node_modules/
+secret.txt
+inbox.json
+last-result.json
+node.log
+refs/
+inbox/
+received.json
+local.json
+*.bak
+
+# OS / editor noise (a public repo will be cloned on other platforms)
+.DS_Store
+Thumbs.db
+*.log
+dist/
