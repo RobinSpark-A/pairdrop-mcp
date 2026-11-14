@@ -74,6 +74,7 @@ class PairDropNode extends EventEmitter {
     this.closed = false;
     this._resolve = null;
     this._reject = null;
+    this.retryCount = 0;
 
     // Receive side. Files land in cfg.INBOX_DIR; every completed file is
     // emitted as 'file-received' so a resident service can hand it back once.
@@ -83,6 +84,12 @@ class PairDropNode extends EventEmitter {
       record => {
         this.received.push(record);
         this.emit('file-received', record);
+      },
+      {
+        onStall: name => {
+          warn('incoming transfer stalled: ' + name + ' (reset to idle)');
+          this.emit('receive-stalled', { name: name });
+        }
       }
     );
   }
@@ -123,7 +130,8 @@ class PairDropNode extends EventEmitter {
 
   _scheduleReconnect() {
     if (this.reconnectTimer || this.closed) return;
-    this._resetPeer(false);
+    // A signaling-socket drop is also a transfer drop: arm the auto-resend.
+    this._resetPeer(true);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
@@ -148,10 +156,14 @@ class PairDropNode extends EventEmitter {
 
       case 'display-name':
         this.myPeerId = msg.peerId;
+        // The signaling server derives deviceName from our User-Agent. All
+        // instances of this node share the same UA, so this value lets us
+        // recognise (and ignore) other copies of ourselves in the same room.
+        this.myDeviceName = msg.deviceName || null;
         // Same order as the browser client: join ip room, then announce pair secrets.
         this._send({ type: 'join-ip-room' });
         this._send({ type: 'room-secrets', roomSecrets: [this.secret] });
-        log('joined as ' + msg.displayName + ' (' + this.myPeerId + ')');
+        log('joined as ' + msg.displayName + ' (' + this.myPeerId + ') device=' + this.myDeviceName);
         break;
 
       case 'ping':
@@ -192,6 +204,18 @@ class PairDropNode extends EventEmitter {
   _onPeerFound(info, roomType, roomId, isCaller) {
     if (!info || !info.id) return;
     const name = (info.name && info.name.displayName) || '';
+
+    // Several MCP client windows can each start their own copy of this node.
+    // They all share one pair secret and would otherwise treat EACH OTHER as
+    // the phone: one sends, the other auto-accepts, and the tool reports a
+    // false "success" while the real phone receives nothing. Same UA -> same
+    // deviceName, so this reliably identifies another copy of ourselves.
+    if (this.myDeviceName && info.name &&
+        info.name.deviceName === this.myDeviceName) {
+      log('ignoring another node instance ' + name + ' (' + info.id + ')');
+      return;
+    }
+
     const matches = !!this.targetName && name === this.targetName;
     // peers/peer-joined carry the SERVER-generated random display name. A
     // custom name only arrives later via display-name-changed over DataChannel,
@@ -364,11 +388,12 @@ class PairDropNode extends EventEmitter {
     const buffer = fs.readFileSync(abs);
     const name = path.basename(abs);
     this.pendingFile = { name: name, mime: mimeOf(name), size: buffer.length, buffer: buffer };
+    this.retryCount = 0;
     this.offset = 0;
     this.partitionBytes = 0;
     this.state = 'waiting-peer';
     log('QUEUED ' + name + ' (' + buffer.length + ' bytes, ' + this.pendingFile.mime + ')');
-    this._armTimeout(cfg.WAIT_TIMEOUT_MS, 'wait-for-peer timeout');
+    this._armTimeout(cfg.PEER_WAIT_MS, 'wait-for-peer timeout');
 
     const promise = new Promise((resolve, reject) => {
       this._resolve = resolve;
@@ -396,6 +421,9 @@ class PairDropNode extends EventEmitter {
       thumbnailDataUrl: ''
     });
     log('request sent, waiting for files-transfer-response');
+    // The peer is already connected. If it does not answer shortly, fail fast
+    // instead of hanging for the full 10-minute "wait for device" window.
+    this._armTimeout(60000, 'no response from peer');
   }
 
   _sendJSON(obj) {
@@ -421,14 +449,18 @@ class PairDropNode extends EventEmitter {
           return;
         }
         log('transfer ACCEPTED (auto-accept works)');
-        this._armTimeout(cfg.TRANSFER_TIMEOUT_MS, 'transfer timeout');
         this._startSending();
         break;
       case 'partition-received':
+        // A partition ACK is real progress; keep the stall watchdog alive.
+        this._refreshTransferTimeout();
         this._sendNextPartition();
         break;
       case 'progress':
-        break; // UI-only, intentionally not logged to avoid noise
+        // The receiver reports progress while consuming chunks. Any of these
+        // messages proves the transfer is alive, regardless of file size.
+        this._refreshTransferTimeout();
+        break;
       case 'display-name-changed':
         // This is where the phone's REAL custom name finally arrives.
         if (m.displayName) {
@@ -466,8 +498,24 @@ class PairDropNode extends EventEmitter {
     const f = this.pendingFile;
     this.state = 'sending';
     this.offset = 0;
+    this.transferDeadline = Date.now() + cfg.TRANSFER_TIMEOUT_MS;
     this._sendJSON({ type: 'header', size: f.size, name: f.name, mime: f.mime });
     this._sendNextPartition();
+    this._refreshTransferTimeout();
+  }
+
+  // A fixed "5 minute transfer timeout" wrongly kills large files on a slow
+  // TURN relay (~45 KB/s means 5 min only covers ~13 MB). Instead fail only
+  // when NOTHING has progressed for TRANSFER_STALL_MS; TRANSFER_TIMEOUT_MS
+  // stays as an absolute cap so a slow-but-moving transfer can never hang.
+  _refreshTransferTimeout() {
+    if (this.state !== 'sending') return;
+    const remaining = this.transferDeadline - Date.now();
+    if (remaining <= 0) {
+      this._fail('transfer timeout');
+      return;
+    }
+    this._armTimeout(Math.min(cfg.TRANSFER_STALL_MS, remaining), 'transfer stalled');
   }
 
   _sendNextPartition() {
@@ -500,10 +548,12 @@ class PairDropNode extends EventEmitter {
     // Mirrors FileChunker._onChunkRead: file end first, then partition boundary.
     if (this.offset >= f.size) {
       log('all ' + f.size + ' bytes dispatched; waiting for file-transfer-complete');
+      this._refreshTransferTimeout();
       return;
     }
     if (this.partitionBytes >= cfg.PARTITION_SIZE) {
       this._sendJSON({ type: 'partition', offset: this.offset });
+      this._refreshTransferTimeout();
       return; // stop and wait for partition-received
     }
     setImmediate(() => this._readChunk());
@@ -545,9 +595,32 @@ class PairDropNode extends EventEmitter {
     this.remoteDescSet = false;
     this.pendingCandidates = [];
     this.waitingForBuffer = false;
-    if (failCurrent && (this.state === 'sending' || this.state === 'waiting-response')) {
-      this._fail('peer disconnected during transfer');
+    if (failCurrent &&
+        (this.state === 'sending' || this.state === 'waiting-response')) {
+      this._handleTransferDrop();
     }
+  }
+
+  // The wire protocol has no resume, so a reconnect resends the whole file.
+  // The caller's Promise stays pending until success / exhaustion / timeout,
+  // so no polling is needed while waiting for the phone to come back.
+  _handleTransferDrop() {
+    if (!this.pendingFile || !this._reject) return;
+    if (this.retryCount >= cfg.MAX_SEND_RETRIES) {
+      this._fail('peer disconnected during transfer (retries exhausted)');
+      return;
+    }
+    this.retryCount++;
+    this.state = 'waiting-peer';
+    this.offset = 0;
+    this.partitionBytes = 0;
+    this._armTimeout(cfg.RETRY_WAIT_MS, 'reconnect timeout');
+    log('transfer interrupted; auto-resend armed (attempt ' + this.retryCount +
+        '/' + cfg.MAX_SEND_RETRIES + ')');
+    this.emit('retry-scheduled', {
+      attempt: this.retryCount,
+      file: this.pendingFile.name
+    });
   }
 
   close() {

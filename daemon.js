@@ -162,7 +162,7 @@ server = http.createServer((req, res) => {
       const timer = setTimeout(() => {
         error('daemon wait timeout');
         finish({ ok: false, error: 'daemon wait timeout' });
-      }, cfg.WAIT_TIMEOUT_MS + 15000);
+      }, cfg.SEND_TOTAL_MS);
       current = { res: res, timer: timer, path: filePath };
 
       node.sendFile(path.resolve(filePath))

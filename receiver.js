@@ -25,9 +25,12 @@ function uniquePath(name) {
 }
 
 class IncomingTransfer {
-  constructor(send, onFile) {
+  constructor(send, onFile, opts = {}) {
     this._send = send;
     this._onFile = onFile;
+    this.stallMs = opts.stallMs || cfg.RECEIVE_STALL_MS;
+    this.onStall = opts.onStall || null;
+    this.stallTimer = null;
     this.active = false;
     this.files = [];
     this.totalSize = 0;
@@ -41,18 +44,41 @@ class IncomingTransfer {
     return this.active || !!this.current;
   }
 
+  // Any incoming activity resets the watchdog. A sender that disappears
+  // mid-file (without a clean disconnect) otherwise leaves us stuck in
+  // "already receiving", rejecting every later request forever.
+  _touch() {
+    this._clearStall();
+    if (!this.active) return;
+    this.stallTimer = setTimeout(() => {
+      this.stallTimer = null;
+      const name = this.current ? this.current.name : 'unknown';
+      warn('incoming transfer stalled: ' + name + ' (resetting to idle)');
+      this.abort();
+      if (this.onStall) this.onStall(name);
+    }, this.stallMs);
+  }
+
+  _clearStall() {
+    if (this.stallTimer) clearTimeout(this.stallTimer);
+    this.stallTimer = null;
+  }
+
   onMessage(m) {
     switch (m.type) {
       case 'request':
         this._onRequest(m);
+        this._touch();
         break;
       case 'header':
         this._onHeader(m);
+        this._touch();
         break;
       case 'partition':
         // The sender stops and waits after every 1,000,000 bytes. Without this
         // ACK the phone silently stalls (the official client has no timeout).
         this._send({ type: 'partition-received', offset: m.offset });
+        this._touch();
         break;
       case 'text':
         // Text messages are not files; acknowledge so the sender can finish.
@@ -73,6 +99,7 @@ class IncomingTransfer {
     // than the network path, so no explicit pause/resume is needed here.
     cur.stream.write(buf);
     cur.received += buf.length;
+    this._touch();
 
     const progress = this.totalSize > 0
       ? (this.totalBytesReceived + cur.received) / this.totalSize
@@ -84,6 +111,7 @@ class IncomingTransfer {
 
     if (cur.received >= cur.size) {
       cur.finished = true;
+      this._clearStall();
       cur.stream.end(() => this._finish());
     }
   }
@@ -144,6 +172,7 @@ class IncomingTransfer {
 
   _finish() {
     if (!this.current) return;
+    this._clearStall();
     const cur = this.current;
     const complete = cur.received === cur.size;
 
@@ -173,13 +202,20 @@ class IncomingTransfer {
     if (this._onFile) this._onFile(record);
     if (this.index >= this.files.length) {
       this.active = false;
+      this._clearStall();
       log('incoming transfer finished');
     }
   }
 
   abort() {
+    this._clearStall();
     if (this.current) {
       try { this.current.stream.destroy(); } catch (_) {}
+      // A half-written file is useless (the protocol has no resume); remove it
+      // so the inbox never fills up with truncated, unopenable leftovers.
+      if (!this.current.finished) {
+        try { fs.unlinkSync(this.current.path); } catch (_) {}
+      }
       this.current = null;
     }
     this.active = false;

@@ -41,8 +41,12 @@ const defaults = {
   FILES_QUEUE_TIMEOUT_MS: 30000,
 
   // Timing
-  WAIT_TIMEOUT_MS: 10 * 60 * 1000,
-  TRANSFER_TIMEOUT_MS: 5 * 60 * 1000,
+  WAIT_TIMEOUT_MS: 10 * 60 * 1000,       // pairing / waiting for an incoming file
+  PEER_WAIT_MS: 5 * 60 * 1000,           // send_file: wait for the phone to appear
+  TRANSFER_TIMEOUT_MS: 30 * 60 * 1000,   // absolute cap for one whole transfer
+  TRANSFER_STALL_MS: 90 * 1000,          // fail only if NO progress for this long
+  RECEIVE_STALL_MS: 2 * 60 * 1000,       // receive side: reset a half-finished file
+  SEND_TOTAL_MS: 60 * 60 * 1000,         // daemon / ask.js outer guard
   PONG_GRACE_MS: 4000,
 
   // One-shot CLI lifecycle AFTER a successful transfer
@@ -51,6 +55,14 @@ const defaults = {
   MAX_SESSION_MS: 10 * 60 * 1000,
   DAEMON_IDLE_MS: Number(process.env.PAIRDROP_DAEMON_IDLE_MS) || 3 * 60 * 1000,
   DAEMON_MAX_SESSION_MS: 30 * 60 * 1000,
+  // MCP server: release the PairDropNode (WS / WebRTC / heartbeat) when idle,
+  // but keep the tiny stdio process alive so the client stays connected.
+  MCP_IDLE_MS: Number(process.env.PAIRDROP_MCP_IDLE_MS) || 3 * 60 * 1000,
+
+  // Auto-resend when the phone drops mid-transfer. Whole-file resend (the
+  // protocol has no resume), bounded by count and a reconnect wait window.
+  MAX_SEND_RETRIES: 3,
+  RETRY_WAIT_MS: Number(process.env.PAIRDROP_RETRY_WAIT_MS) || 5 * 60 * 1000,
 
   // Local control interface
   CONTROL_HOST: '127.0.0.1',

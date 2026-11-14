@@ -52,7 +52,7 @@ const TOOLS = [
   },
   {
     name: 'pairdrop_inbox',
-    description: '列出本次运行已接收的文件。',
+    description: '列出已接收的文件。',
     inputSchema: { type: 'object', properties: {} }
   }
 ];
@@ -60,6 +60,33 @@ const TOOLS = [
 let node = null;
 let readyPromise = null;
 let pairingPromise = null;
+let idleTimer = null;
+let busyRequests = 0;
+
+// A stdio MCP server must not simply exit when idle: the client would report
+// "Not connected" and require a manual re-trust. Instead we release the heavy
+// PairDropNode (WebSocket, WebRTC, heartbeat) and keep only the tiny JSON-RPC
+// process. The next send_file / receive_file rebuilds the node on demand.
+function touch() {
+  if (idleTimer) clearTimeout(idleTimer);
+  idleTimer = null;
+  if (!node) return;
+  idleTimer = setTimeout(reclaim, cfg.MCP_IDLE_MS);
+}
+
+function reclaim() {
+  idleTimer = null;
+  // Never tear down a connection while a caller is still waiting for a result.
+  if (busyRequests > 0 || pairingPromise) {
+    touch();
+    return;
+  }
+  if (node) {
+    try { node.close(); } catch (_) {}
+    node = null;
+    process.stderr.write('[pairdrop] released idle node connection\n');
+  }
+}
 
 function send(msg) {
   process.stdout.write(JSON.stringify(msg) + '\n');
@@ -104,8 +131,18 @@ async function ensureNode() {
   if (!node) {
     const { PairDropNode } = require('./client');
     node = new PairDropNode();
+    // Persist received files so the list survives an idle reclaim.
+    node.on('file-received', record => {
+      try {
+        fs.writeFileSync(cfg.RECEIVED_FILE, JSON.stringify(node.received, null, 2));
+      } catch (_) {}
+    });
+    node.on('retry-scheduled', d => {
+      notify('连接中断，等待手机重连后自动重发（第 ' + d.attempt + ' 次：' + d.file + '）');
+    });
     node.connect();
   }
+  touch();
   return node;
 }
 
@@ -153,30 +190,52 @@ async function setupTool(args) {
 
 async function sendTool(args) {
   if (!args.path) throw new Error('path is required');
-  const n = await ensureNode();
-  if (!n) {
-    return { ok: false, error: '尚未配对：请先调用 pairdrop_setup（可传手机端 6 位码）' };
+  busyRequests++;
+  try {
+    const n = await ensureNode();
+    if (!n) {
+      return { ok: false, error: '尚未配对：请先调用 pairdrop_setup（可传手机端 6 位码）' };
+    }
+    return await n.sendFile(args.path);
+  } finally {
+    busyRequests--;
+    touch();
   }
-  return await n.sendFile(args.path);
 }
 
 async function receiveTool() {
-  const n = await ensureNode();
-  if (!n) {
-    return { ok: false, error: '尚未配对：请先调用 pairdrop_setup（可传手机端 6 位码）' };
-  }
-  return new Promise(resolve => {
-    const timer = setTimeout(() => {
-      n.removeListener('file-received', onFile);
-      resolve({ ok: false, error: 'receive wait timeout' });
-    }, cfg.WAIT_TIMEOUT_MS);
-    function onFile(record) {
-      clearTimeout(timer);
-      n.removeListener('file-received', onFile);
-      resolve({ ok: true, file: record });
+  busyRequests++;
+  try {
+    const n = await ensureNode();
+    if (!n) {
+      return { ok: false, error: '尚未配对：请先调用 pairdrop_setup（可传手机端 6 位码）' };
     }
-    n.on('file-received', onFile);
-  });
+    return await new Promise(resolve => {
+      let settled = false;
+      let timer = null;
+      const finish = result => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        n.removeListener('file-received', onFile);
+        n.removeListener('receive-stalled', onStall);
+        resolve(result);
+      };
+      timer = setTimeout(
+        () => finish({ ok: false, error: 'receive wait timeout' }),
+        cfg.WAIT_TIMEOUT_MS
+      );
+      function onFile(record) { finish({ ok: true, file: record }); }
+      function onStall(d) {
+        finish({ ok: false, error: 'incoming transfer stalled: ' + d.name });
+      }
+      n.on('file-received', onFile);
+      n.on('receive-stalled', onStall);
+    });
+  } finally {
+    busyRequests--;
+    touch();
+  }
 }
 
 async function statusTool() {
@@ -187,9 +246,11 @@ async function statusTool() {
     displayName: cfg.DISPLAY_NAME,
     port: cfg.CONTROL_PORT,
     inbox: cfg.INBOX_DIR,
+    nodeActive: !!node,
     online: node ? !!node.targetPeerId : false,
     channelOpen: node ? !!(node.dc && node.dc.isOpen()) : false,
     receivedCount: node ? node.received.length : 0,
+    idleMs: cfg.MCP_IDLE_MS,
     setup: ready.steps
   };
 }
@@ -267,6 +328,7 @@ getReady().catch(e => {
 });
 
 function shutdown() {
+  if (idleTimer) clearTimeout(idleTimer);
   if (node) {
     try { node.close(); } catch (_) {}
   }

@@ -41,7 +41,7 @@ function request(method, urlPath, body) {
       });
     });
     // A hanging /receive or /send can legitimately be quiet for 10 minutes.
-    req.setTimeout(cfg.WAIT_TIMEOUT_MS + 60000, () => req.destroy(new Error('request timeout')));
+    req.setTimeout(cfg.SEND_TOTAL_MS, () => req.destroy(new Error('request timeout')));
     req.on('error', reject);
     if (data) req.write(data);
     req.end();
